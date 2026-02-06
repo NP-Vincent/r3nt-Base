@@ -4,9 +4,17 @@ pragma solidity ^0.8.26;
 import {Initializable} from "@openzeppelin/contracts-upgradeable/proxy/utils/Initializable.sol";
 import {UUPSUpgradeable} from "@openzeppelin/contracts-upgradeable/proxy/utils/UUPSUpgradeable.sol";
 import {OwnableUpgradeable} from "@openzeppelin/contracts-upgradeable/access/OwnableUpgradeable.sol";
+import {IERC20Upgradeable} from "@openzeppelin/contracts-upgradeable/token/ERC20/IERC20Upgradeable.sol";
+import {SafeERC20Upgradeable} from "@openzeppelin/contracts-upgradeable/token/ERC20/utils/SafeERC20Upgradeable.sol";
 
 interface IPlatformConfig {
     function rentRouter() external view returns (address);
+
+    function liquidityVault() external view returns (address);
+}
+
+interface IERC4626Asset {
+    function asset() external view returns (address);
 }
 
 interface IRentRouter {
@@ -23,6 +31,8 @@ interface IRentRouter {
  * @notice Atomic rent obligation tied to a listing.
  */
 contract Booking is Initializable, UUPSUpgradeable, OwnableUpgradeable {
+    using SafeERC20Upgradeable for IERC20Upgradeable;
+
     enum PaymentCadence {
         NONE,
         DAILY,
@@ -35,6 +45,12 @@ contract Booking is Initializable, UUPSUpgradeable, OwnableUpgradeable {
         COMPLETED,
         DEFAULTED,
         CANCELLED
+    }
+
+    enum DepositOutcome {
+        NONE,
+        RELEASED_TO_TENANT,
+        RELEASED_TO_LANDLORD
     }
 
     address public platform;
@@ -65,6 +81,16 @@ contract Booking is Initializable, UUPSUpgradeable, OwnableUpgradeable {
     uint16 public agentFeeBps;
     uint16 public facilitationFeeBps;
 
+    uint256 public depositAmount;
+    address public depositToken;
+    address public depositArbiter;
+
+    uint64 public disputeRaisedAt;
+    uint64 public disputeTimeoutSeconds;
+    bool public depositFunded;
+    bool public depositDisputed;
+    DepositOutcome public depositOutcome;
+
     event BookingInitialized(
         address indexed platform,
         address indexed listing,
@@ -86,6 +112,16 @@ contract Booking is Initializable, UUPSUpgradeable, OwnableUpgradeable {
         uint64 defaultEligibleAt,
         uint32 installmentPaidCount
     );
+    event DepositConfigured(uint256 depositAmount, address indexed token, address indexed arbiter, uint64 disputeTimeout);
+    event DepositFunded(address indexed tenant, uint256 amount);
+    event DepositDisputeRaised(address indexed caller, uint64 indexed raisedAt);
+    event DepositResolved(
+        address indexed resolver,
+        address indexed recipient,
+        uint256 amount,
+        DepositOutcome outcome,
+        bool viaDispute
+    );
 
     /// @custom:oz-upgrades-unsafe-allow constructor
     constructor() {
@@ -104,7 +140,10 @@ contract Booking is Initializable, UUPSUpgradeable, OwnableUpgradeable {
         uint256 rentAmount_,
         PaymentCadence cadence_,
         uint16 agentFeeBps_,
-        uint16 facilitationFeeBps_
+        uint16 facilitationFeeBps_,
+        uint256 depositAmount_,
+        address depositArbiter_,
+        uint64 disputeTimeoutSeconds_
     ) external initializer {
         require(owner_ != address(0), "owner=0");
         require(platform_ != address(0), "platform=0");
@@ -126,6 +165,15 @@ contract Booking is Initializable, UUPSUpgradeable, OwnableUpgradeable {
         cadence = cadence_;
         agentFeeBps = agentFeeBps_;
         facilitationFeeBps = facilitationFeeBps_;
+        depositAmount = depositAmount_;
+        depositToken = _resolveDepositTokenFromPlatform(platform_);
+        depositArbiter = depositArbiter_;
+        disputeTimeoutSeconds = disputeTimeoutSeconds_;
+        if (depositAmount_ > 0) {
+            require(depositToken != address(0), "deposit token");
+            require(depositArbiter_ != address(0), "arbiter=0");
+            require(disputeTimeoutSeconds_ > 0, "timeout=0");
+        }
 
         status = Status.ACTIVE;
         totalRent = rentAmount_;
@@ -141,6 +189,7 @@ contract Booking is Initializable, UUPSUpgradeable, OwnableUpgradeable {
         defaultEligibleAt = _addGrace(cadenceWindowEnd, gracePeriodSeconds);
 
         emit BookingInitialized(platform_, listing_, tenant_, startDate_, endDate_);
+        emit DepositConfigured(depositAmount_, depositToken, depositArbiter_, disputeTimeoutSeconds_);
         emit StatusTransition(Status.ACTIVE, Status.ACTIVE, uint64(block.timestamp));
         emit CadenceCheckpointUpdated(
             cadenceWindowStart,
@@ -180,6 +229,7 @@ contract Booking is Initializable, UUPSUpgradeable, OwnableUpgradeable {
         require(block.timestamp > defaultEligibleAt, "grace");
 
         _setStatus(Status.DEFAULTED);
+        _releaseDepositOnStatusTransition();
     }
 
     function complete() external {
@@ -193,10 +243,56 @@ contract Booking is Initializable, UUPSUpgradeable, OwnableUpgradeable {
         require(status == Status.ACTIVE, "status");
         require(paidRent == 0, "paid");
         _setStatus(Status.CANCELLED);
+        _releaseDepositToTenantIfHeld();
+    }
+
+    function fundDeposit() external {
+        require(msg.sender == tenant, "tenant only");
+        require(status == Status.ACTIVE, "status");
+        require(depositAmount > 0, "deposit=0");
+        require(!depositFunded, "already funded");
+
+        depositFunded = true;
+        IERC20Upgradeable(depositToken).safeTransferFrom(msg.sender, address(this), depositAmount);
+
+        emit DepositFunded(msg.sender, depositAmount);
+    }
+
+    function raiseDepositDispute() external {
+        require(msg.sender == tenant || msg.sender == owner() || msg.sender == agent, "dispute role");
+        require(depositFunded, "not funded");
+        require(depositOutcome == DepositOutcome.NONE, "resolved");
+        require(!depositDisputed, "already disputed");
+
+        depositDisputed = true;
+        disputeRaisedAt = uint64(block.timestamp);
+
+        emit DepositDisputeRaised(msg.sender, disputeRaisedAt);
+    }
+
+    function resolveDepositDispute(bool releaseToTenant_) external {
+        require(depositDisputed, "no dispute");
+        require(depositOutcome == DepositOutcome.NONE, "resolved");
+
+        bool arbiterResolution = msg.sender == depositArbiter;
+        if (!arbiterResolution) {
+            require(block.timestamp > disputeRaisedAt + disputeTimeoutSeconds, "arbiter window");
+            require(msg.sender == tenant || msg.sender == owner(), "resolver");
+
+            if (status == Status.DEFAULTED) {
+                releaseToTenant_ = false;
+            } else {
+                require(status == Status.COMPLETED || status == Status.CANCELLED, "status unresolved");
+                releaseToTenant_ = true;
+            }
+        }
+
+        _resolveDeposit(releaseToTenant_, true);
     }
 
     function _complete() internal {
         _setStatus(Status.COMPLETED);
+        _releaseDepositOnStatusTransition();
     }
 
     function _setStatus(Status newStatus) internal {
@@ -207,6 +303,48 @@ contract Booking is Initializable, UUPSUpgradeable, OwnableUpgradeable {
 
     function _rentRouter() internal view returns (address) {
         return IPlatformConfig(platform).rentRouter();
+    }
+
+    function _resolveDepositTokenFromPlatform(address platform_) internal view returns (address) {
+        address vault = IPlatformConfig(platform_).liquidityVault();
+        if (vault == address(0)) {
+            return address(0);
+        }
+
+        return IERC4626Asset(vault).asset();
+    }
+
+    function _releaseDepositOnStatusTransition() internal {
+        if (!depositFunded || depositDisputed || depositOutcome != DepositOutcome.NONE) {
+            return;
+        }
+
+        if (status == Status.COMPLETED) {
+            _resolveDeposit(true, false);
+        } else if (status == Status.DEFAULTED) {
+            _resolveDeposit(false, false);
+        }
+    }
+
+    function _releaseDepositToTenantIfHeld() internal {
+        if (!depositFunded || depositDisputed || depositOutcome != DepositOutcome.NONE) {
+            return;
+        }
+
+        _resolveDeposit(true, false);
+    }
+
+    function _resolveDeposit(bool releaseToTenant_, bool viaDispute_) internal {
+        require(depositFunded, "not funded");
+
+        address recipient = releaseToTenant_ ? tenant : owner();
+        depositOutcome = releaseToTenant_ ? DepositOutcome.RELEASED_TO_TENANT : DepositOutcome.RELEASED_TO_LANDLORD;
+        depositFunded = false;
+        depositDisputed = false;
+
+        IERC20Upgradeable(depositToken).safeTransfer(recipient, depositAmount);
+
+        emit DepositResolved(msg.sender, recipient, depositAmount, depositOutcome, viaDispute_);
     }
 
     function _enforceCadenceWindow() internal view {
@@ -287,5 +425,5 @@ contract Booking is Initializable, UUPSUpgradeable, OwnableUpgradeable {
 
     function _authorizeUpgrade(address newImplementation) internal override onlyOwner {}
 
-    uint256[39] private __gap;
+    uint256[35] private __gap;
 }
